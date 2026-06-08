@@ -1,6 +1,7 @@
 .vscode
 *.swp
 **/target
+tests/benchly/.pg-socket/
 **/*.rs.bk
 Cargo.lock
 .github/**/*.md

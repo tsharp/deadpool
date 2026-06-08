@@ -1,5 +1,6 @@
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +20,7 @@ pub struct LatencyStats {
 pub struct MetricsCollector {
     histogram: Histogram<u64>,
     failures: usize,
+    failure_causes: HashMap<String, usize>,
     start_time: Option<Instant>,
     end_time: Option<Instant>,
 }
@@ -27,11 +29,12 @@ impl MetricsCollector {
     pub fn new() -> Self {
         // Create histogram with max value of 1 hour (3,600,000 ms) and 3 significant digits
         let histogram =
-            Histogram::<u64>::new_with_max(3_600_000, 3).expect("Failed to create histogram");
+            Histogram::<u64>::new_with_max(3_600_000_000, 3).expect("Failed to create histogram");
 
         Self {
             histogram,
             failures: 0,
+            failure_causes: HashMap::new(),
             start_time: None,
             end_time: None,
         }
@@ -46,13 +49,14 @@ impl MetricsCollector {
     }
 
     pub fn record_success(&mut self, latency: Duration) {
-        let latency_ms = latency.as_millis() as u64;
+        let latency_us = latency.as_micros() as u64;
         // Saturate at max value if latency exceeds histogram range
-        self.histogram.saturating_record(latency_ms);
+        self.histogram.saturating_record(latency_us);
     }
 
-    pub fn record_failure(&mut self) {
+    pub fn record_failure(&mut self, cause: impl Into<String>) {
         self.failures += 1;
+        *self.failure_causes.entry(cause.into()).or_default() += 1;
     }
 
     pub fn total_operations(&self) -> usize {
@@ -61,6 +65,10 @@ impl MetricsCollector {
 
     pub fn successful_operations(&self) -> usize {
         self.histogram.len() as usize
+    }
+
+    pub fn failure_causes(&self) -> &HashMap<String, usize> {
+        &self.failure_causes
     }
 
     pub fn total_failures(&self) -> usize {
@@ -136,11 +144,12 @@ mod tests {
         collector.record_success(Duration::from_millis(1));
         collector.record_success(Duration::from_millis(2));
         collector.record_success(Duration::from_millis(5));
-        collector.record_failure();
+        collector.record_failure("connection error");
 
         assert_eq!(collector.total_operations(), 4);
         assert_eq!(collector.successful_operations(), 3);
         assert_eq!(collector.total_failures(), 1);
+        assert_eq!(collector.failure_causes()["connection error"], 1);
 
         let stats = collector.calculate_latency_stats();
         assert!(stats.min > 0.0);
