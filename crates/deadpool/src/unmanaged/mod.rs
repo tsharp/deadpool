@@ -35,12 +35,13 @@ use std::{
     convert::TryInto,
     ops::{Deref, DerefMut},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Weak,
         atomic::{AtomicIsize, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
+use crossbeam_queue::SegQueue;
 use deadpool_runtime::timeout;
 use tokio::sync::{Semaphore, TryAcquireError};
 
@@ -81,10 +82,7 @@ impl<T> Drop for Object<T> {
     fn drop(&mut self) {
         if let Some(obj) = self.obj.take() {
             if let Some(pool) = self.pool.upgrade() {
-                {
-                    let mut queue = pool.queue.lock().unwrap();
-                    queue.push(obj);
-                }
+                pool.queue.push(obj);
                 let _ = pool.available.fetch_add(1, Ordering::Relaxed);
                 pool.semaphore.add_permits(1);
                 pool.clean_up();
@@ -162,7 +160,7 @@ impl<T> Pool<T> {
         Self {
             inner: Arc::new(PoolInner {
                 config: *config,
-                queue: Mutex::new(Vec::with_capacity(config.max_size)),
+                queue: SegQueue::new(),
                 size: AtomicUsize::new(0),
                 size_semaphore: Semaphore::new(config.max_size),
                 available: AtomicIsize::new(0),
@@ -194,10 +192,7 @@ impl<T> Pool<T> {
             TryAcquireError::NoPermits => PoolError::Timeout,
             TryAcquireError::Closed => PoolError::Closed,
         })?;
-        let obj = {
-            let mut queue = inner.queue.lock().unwrap();
-            queue.pop().unwrap()
-        };
+        let obj = inner.queue.pop().unwrap();
         permit.forget();
         let _ = inner.available.fetch_sub(1, Ordering::Relaxed);
         Ok(Object {
@@ -234,10 +229,7 @@ impl<T> Pool<T> {
             }
             (Some(_), None) => Err(PoolError::NoRuntimeSpecified),
         }?;
-        let obj = {
-            let mut queue = inner.queue.lock().unwrap();
-            queue.pop().unwrap()
-        };
+        let obj = inner.queue.pop().unwrap();
         permit.forget();
         let _ = inner.available.fetch_sub(1, Ordering::Relaxed);
         Ok(Object {
@@ -294,10 +286,7 @@ impl<T> Pool<T> {
     /// the `size_semaphore`.
     fn _add(&self, object: T) {
         let _ = self.inner.size.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut queue = self.inner.queue.lock().unwrap();
-            queue.push(object);
-        }
+        self.inner.queue.push(object);
         let _ = self.inner.available.fetch_add(1, Ordering::Relaxed);
         self.inner.semaphore.add_permits(1);
     }
@@ -355,7 +344,7 @@ impl<T> Pool<T> {
 #[derive(Debug)]
 struct PoolInner<T> {
     config: PoolConfig,
-    queue: Mutex<Vec<T>>,
+    queue: SegQueue<T>,
     size: AtomicUsize,
     /// This semaphore has as many permits as `max_size - size`. Every time
     /// an [`Object`] is added to the [`Pool`] a permit is removed from the
@@ -385,12 +374,14 @@ impl<T> PoolInner<T> {
 
     /// Removes all the [`Object`]s which are currently part of this [`Pool`].
     fn clear(&self) {
-        let mut queue = self.queue.lock().unwrap();
-        let _ = self.size.fetch_sub(queue.len(), Ordering::Relaxed);
+        let mut cleared = 0;
+        while self.queue.pop().is_some() {
+            cleared += 1;
+        }
+        let _ = self.size.fetch_sub(cleared, Ordering::Relaxed);
         let _ = self
             .available
-            .fetch_sub(queue.len() as isize, Ordering::Relaxed);
-        queue.clear();
+            .fetch_sub(cleared as isize, Ordering::Relaxed);
     }
 
     /// Indicates whether this [`Pool`] has been closed.
@@ -410,11 +401,15 @@ where
     /// Creates a new [`Pool`] from the given [`ExactSizeIterator`] of
     /// [`Object`]s.
     fn from(iter: I) -> Self {
-        let queue = iter.into_iter().collect::<Vec<_>>();
-        let len = queue.len();
+        let iter = iter.into_iter();
+        let len = iter.len();
+        let queue = SegQueue::new();
+        for object in iter {
+            queue.push(object);
+        }
         Self {
             inner: Arc::new(PoolInner {
-                queue: Mutex::new(queue),
+                queue,
                 config: PoolConfig::new(len),
                 size: AtomicUsize::new(len),
                 size_semaphore: Semaphore::new(0),

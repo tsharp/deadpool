@@ -11,7 +11,7 @@
     Label for this benchmark run (default: timestamp)
 
 .PARAMETER Workers
-    Number of concurrent workers (default: 8)
+    Number of concurrent workers (default: 16)
 
 .PARAMETER RunTime
     Benchmark duration in seconds (default: 90)
@@ -28,7 +28,7 @@
 
 param(
     [string]$RunLabel = "",
-    [int]$Workers = 8,
+    [int]$Workers = 16,
     [int]$RunTime = 15,
     [int]$Warmup = 5,
     [int]$PoolSize = $Workers * 2,

@@ -2,10 +2,8 @@
 
 use std::{sync::Arc, time::Duration};
 
-use tokio::{
-    sync::{Mutex, mpsc},
-    task, time,
-};
+use crossbeam_queue::SegQueue;
+use tokio::{sync::Notify, task, time};
 
 use deadpool::managed::{self, Metrics, RecycleError, RecycleResult};
 
@@ -13,23 +11,51 @@ type Pool = managed::Pool<Manager>;
 
 #[derive(Clone)]
 struct Manager {
-    create_rx: Arc<Mutex<mpsc::Receiver<Result<(), ()>>>>,
-    recycle_rx: Arc<Mutex<mpsc::Receiver<Result<(), ()>>>>,
+    create_results: Arc<ScriptedResults>,
+    recycle_results: Arc<ScriptedResults>,
     remote_control: RemoteControl,
 }
 
 #[derive(Clone)]
 struct RemoteControl {
-    create_tx: mpsc::Sender<Result<(), ()>>,
-    _recycle_tx: mpsc::Sender<Result<(), ()>>,
+    create_results: Arc<ScriptedResults>,
+    _recycle_results: Arc<ScriptedResults>,
+}
+
+struct ScriptedResults {
+    queue: SegQueue<Result<(), ()>>,
+    notify: Notify,
+}
+
+impl ScriptedResults {
+    fn new() -> Self {
+        Self {
+            queue: SegQueue::new(),
+            notify: Notify::new(),
+        }
+    }
+
+    fn push(&self, result: Result<(), ()>) {
+        self.queue.push(result);
+        self.notify.notify_one();
+    }
+
+    async fn pop(&self) -> Result<(), ()> {
+        loop {
+            if let Some(result) = self.queue.pop() {
+                return result;
+            }
+            self.notify.notified().await;
+        }
+    }
 }
 
 impl RemoteControl {
     pub fn create_ok(&mut self) {
-        self.create_tx.try_send(Ok(())).unwrap();
+        self.create_results.push(Ok(()));
     }
     pub fn create_err(&mut self) {
-        self.create_tx.try_send(Err(())).unwrap();
+        self.create_results.push(Err(()));
     }
     /*
     pub fn recycle_ok(&mut self) {
@@ -43,14 +69,14 @@ impl RemoteControl {
 
 impl Manager {
     pub fn new() -> Self {
-        let (create_tx, create_rx) = mpsc::channel(16);
-        let (recycle_tx, recycle_rx) = mpsc::channel(16);
+        let create_results = Arc::new(ScriptedResults::new());
+        let recycle_results = Arc::new(ScriptedResults::new());
         Self {
-            create_rx: Arc::new(Mutex::new(create_rx)),
-            recycle_rx: Arc::new(Mutex::new(recycle_rx)),
+            create_results: create_results.clone(),
+            recycle_results: recycle_results.clone(),
             remote_control: RemoteControl {
-                create_tx,
-                _recycle_tx: recycle_tx,
+                create_results,
+                _recycle_results: recycle_results,
             },
         }
     }
@@ -61,11 +87,11 @@ impl managed::Manager for Manager {
     type Error = ();
 
     async fn create(&self) -> Result<(), ()> {
-        self.create_rx.lock().await.recv().await.unwrap()
+        self.create_results.pop().await
     }
 
     async fn recycle(&self, _conn: &mut (), _: &Metrics) -> RecycleResult<()> {
-        match self.recycle_rx.lock().await.recv().await.unwrap() {
+        match self.recycle_results.pop().await {
             Ok(()) => Ok(()),
             Err(e) => Err(RecycleError::Backend(e)),
         }

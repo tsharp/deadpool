@@ -45,6 +45,7 @@ with-uuid-1 = ["tokio-postgres/with-uuid-1"]
 
 
 [dependencies]
+arc-swap = "1.7"
 async-trait = "0.1.80"
 deadpool = { path = "../deadpool", version = "0.13.0", default-features = false, features = [
     "managed",

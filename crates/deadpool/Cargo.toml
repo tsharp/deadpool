@@ -23,6 +23,7 @@ rt_async-std_1 = ["deadpool-runtime/async-std_1"]
 rt_smol_2 = ["deadpool-runtime/smol_2"]
 
 [dependencies]
+crossbeam-queue = "0.3"
 # `serde` feature
 serde = { version = "1.0.103", features = ["derive"], optional = true }
 # `rt_async-std_1` feature

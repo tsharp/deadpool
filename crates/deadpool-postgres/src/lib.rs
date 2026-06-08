@@ -31,11 +31,12 @@ use std::{
     ops::{Deref, DerefMut},
     pin::Pin,
     sync::{
-        Arc, Mutex, RwLock, Weak,
+        Arc, Weak,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
+use arc_swap::ArcSwap;
 use deadpool::managed;
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::spawn;
@@ -234,24 +235,31 @@ where
 /// access for clearing all caches and removing single statements from them.
 #[derive(Default, Debug)]
 pub struct StatementCaches {
-    caches: Mutex<Vec<Weak<StatementCache>>>,
+    caches: ArcSwap<Vec<Weak<StatementCache>>>,
 }
 
 impl StatementCaches {
     fn attach(&self, cache: &Arc<StatementCache>) {
         let cache = Arc::downgrade(cache);
-        self.caches.lock().unwrap().push(cache);
+        self.update_caches(|caches| caches.push(cache));
     }
 
     fn detach(&self, cache: &Arc<StatementCache>) {
         let cache = Arc::downgrade(cache);
-        self.caches.lock().unwrap().retain(|sc| !sc.ptr_eq(&cache));
+        self.update_caches(|caches| caches.retain(|sc| !sc.ptr_eq(&cache)));
+    }
+
+    fn update_caches(&self, update: impl FnOnce(&mut Vec<Weak<StatementCache>>)) {
+        let current = self.caches.load_full();
+        let mut next = (*current).clone();
+        update(&mut next);
+        self.caches.store(Arc::new(next));
     }
 
     /// Clears [`StatementCache`] of all connections which were handed out by a
     /// [`Manager`].
     pub fn clear(&self) {
-        let caches = self.caches.lock().unwrap();
+        let caches = self.caches.load();
         for cache in caches.iter() {
             if let Some(cache) = cache.upgrade() {
                 cache.clear();
@@ -262,7 +270,7 @@ impl StatementCaches {
     /// Removes statement from all caches which were handed out by a
     /// [`Manager`].
     pub fn remove(&self, query: &str, types: &[Type]) {
-        let caches = self.caches.lock().unwrap();
+        let caches = self.caches.load();
         for cache in caches.iter() {
             if let Some(cache) = cache.upgrade() {
                 drop(cache.remove(query, types));
@@ -282,7 +290,7 @@ impl fmt::Debug for StatementCache {
 
 // Allows us to use owned keys in a `HashMap`, but still be able to call `get`
 // with borrowed keys instead of allocating them each time.
-#[derive(Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct StatementCacheKey<'a> {
     query: Cow<'a, str>,
     types: Cow<'a, [Type]>,
@@ -308,14 +316,14 @@ struct StatementCacheKey<'a> {
 /// and [`ClientWrapper::prepare_typed_cached()`] methods instead (or the
 /// similar ones on [`Transaction`]).
 pub struct StatementCache {
-    map: RwLock<HashMap<StatementCacheKey<'static>, Statement>>,
+    map: ArcSwap<HashMap<StatementCacheKey<'static>, Statement>>,
     size: AtomicUsize,
 }
 
 impl StatementCache {
     fn new() -> Self {
         Self {
-            map: RwLock::new(HashMap::new()),
+            map: ArcSwap::from_pointee(HashMap::new()),
             size: AtomicUsize::new(0),
         }
     }
@@ -331,8 +339,7 @@ impl StatementCache {
     /// instance. If you want to clear the [`StatementCache`] of all [`Client`]s
     /// you should be calling `pool.manager().statement_caches.clear()` instead.
     pub fn clear(&self) {
-        let mut map = self.map.write().unwrap();
-        map.clear();
+        self.map.store(Arc::new(HashMap::new()));
         self.size.store(0, Ordering::Relaxed);
     }
 
@@ -347,11 +354,10 @@ impl StatementCache {
             query: Cow::Owned(query.to_owned()),
             types: Cow::Owned(types.to_owned()),
         };
-        let mut map = self.map.write().unwrap();
-        let removed = map.remove(&key);
-        if removed.is_some() {
-            let _ = self.size.fetch_sub(1, Ordering::Relaxed);
-        }
+        let mut removed = None;
+        self.update_map(|map| {
+            removed = map.remove(&key);
+        });
         removed
     }
 
@@ -361,7 +367,7 @@ impl StatementCache {
             query: Cow::Borrowed(query),
             types: Cow::Borrowed(types),
         };
-        self.map.read().unwrap().get(&key).map(ToOwned::to_owned)
+        self.map.load().get(&key).map(ToOwned::to_owned)
     }
 
     /// Inserts a [`Statement`] into this [`StatementCache`].
@@ -370,10 +376,18 @@ impl StatementCache {
             query: Cow::Owned(query.to_owned()),
             types: Cow::Owned(types.to_owned()),
         };
-        let mut map = self.map.write().unwrap();
-        if map.insert(key, stmt).is_none() {
-            let _ = self.size.fetch_add(1, Ordering::Relaxed);
-        }
+        self.update_map(|map| {
+            drop(map.insert(key, stmt));
+        });
+    }
+
+    fn update_map(&self, update: impl FnOnce(&mut HashMap<StatementCacheKey<'static>, Statement>)) {
+        let current = self.map.load_full();
+        let mut next = (*current).clone();
+        update(&mut next);
+        let len = next.len();
+        self.map.store(Arc::new(next));
+        self.size.store(len, Ordering::Relaxed);
     }
 
     /// Creates a new prepared [`Statement`] using this [`StatementCache`], if
