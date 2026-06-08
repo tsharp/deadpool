@@ -1,11 +1,7 @@
 use std::error::Error;
 use std::str::FromStr;
-use std::sync::{
-    atomic::{AtomicI64, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
 
@@ -33,7 +29,6 @@ enum WorkloadError {
 
 pub struct BenchmarkRunner {
     config: BenchmarkConfig,
-    metrics: Arc<Mutex<MetricsCollector>>,
 }
 
 struct BenchmarkPools {
@@ -118,8 +113,8 @@ impl Drop for BenchmarkPools {
 }
 
 impl BenchmarkRunner {
-    pub fn new(config: BenchmarkConfig, metrics: Arc<Mutex<MetricsCollector>>) -> Self {
-        Self { config, metrics }
+    pub fn new(config: BenchmarkConfig) -> Self {
+        Self { config }
     }
 
     pub async fn run(self) -> Result<BenchmarkResults, Box<dyn std::error::Error>> {
@@ -143,23 +138,14 @@ impl BenchmarkRunner {
             "Running benchmark for {}s...",
             self.config.run_time.as_secs()
         );
-        {
-            let mut metrics = self.metrics.lock().await;
-            metrics.start();
-        }
-
-        self.run_phase(&pools, &table_name, self.config.run_time, true)
-            .await?;
-
-        {
-            let mut metrics = self.metrics.lock().await;
-            metrics.stop();
-        }
+        let metrics = self
+            .run_phase(&pools, &table_name, self.config.run_time, true)
+            .await?
+            .expect("recording phase returns metrics");
 
         let end_time = chrono::Utc::now();
 
         // Collect and format results
-        let metrics = self.metrics.lock().await;
         let results = BenchmarkResults::from_metrics(&self.config, &metrics, start_time, end_time);
 
         Ok(results)
@@ -171,35 +157,36 @@ impl BenchmarkRunner {
         table_name: &str,
         duration: Duration,
         record: bool,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Option<MetricsCollector>, Box<dyn std::error::Error>> {
         let start = Instant::now();
         let mut handles = vec![];
-        let next_document_id = Arc::new(AtomicI64::new(1));
         let read_sql = Arc::new(format!("SELECT document FROM {table_name} WHERE id = $1"));
+        let mut metrics = MetricsCollector::new();
+        if record {
+            metrics.start();
+        }
 
         // Spawn worker tasks
         for worker_id in 0..self.config.workers {
-            let metrics = self.metrics.clone();
             let pool = pools.benchmark_pool(self.config.use_timeout_pool);
             let end_time = start + duration;
             let document_count = self.config.document_count;
+            let workers = self.config.workers;
             let workload_mode = self.config.workload_mode;
-            let next_document_id = Arc::clone(&next_document_id);
             let read_sql = Arc::clone(&read_sql);
 
             let handle = tokio::spawn(async move {
                 Self::worker_loop(
                     worker_id,
-                    metrics,
                     pool,
                     end_time,
                     record,
                     document_count,
+                    workers,
                     workload_mode,
-                    next_document_id,
                     read_sql,
                 )
-                .await;
+                .await
             });
 
             handles.push(handle);
@@ -207,10 +194,18 @@ impl BenchmarkRunner {
 
         // Wait for all workers to complete
         for handle in handles {
-            handle.await?;
+            let worker_metrics = handle.await?;
+            if record {
+                metrics.merge(&worker_metrics);
+            }
         }
 
-        Ok(())
+        if record {
+            metrics.stop();
+            Ok(Some(metrics))
+        } else {
+            Ok(None)
+        }
     }
 
     async fn prepare_workload(
@@ -269,24 +264,26 @@ ON CONFLICT (id) DO NOTHING"#
 
     async fn worker_loop(
         _worker_id: usize,
-        metrics: Arc<Mutex<MetricsCollector>>,
         pool: Pool,
         end_time: Instant,
         record: bool,
         document_count: i64,
+        workers: usize,
         workload_mode: WorkloadMode,
-        next_document_id: Arc<AtomicI64>,
         read_sql: Arc<String>,
-    ) {
+    ) -> MetricsCollector {
+        let mut metrics = MetricsCollector::new();
+        let mut document_id = ((_worker_id as i64) % document_count) + 1;
+        let document_step = workers as i64;
+
         let pinned_connection = match workload_mode {
             WorkloadMode::PinnedPointRead => match pool.get().await {
                 Ok(connection) => Some(connection),
                 Err(error) => {
                     if record {
-                        let mut metrics = metrics.lock().await;
                         metrics.record_failure(Self::format_workload_error(&error.into()));
                     }
-                    return;
+                    return metrics;
                 }
             },
             WorkloadMode::PointRead | WorkloadMode::PoolOnly => None,
@@ -295,7 +292,6 @@ ON CONFLICT (id) DO NOTHING"#
         while Instant::now() < end_time {
             let op_start = Instant::now();
 
-            let document_id = Self::next_document_id(&next_document_id, document_count);
             let result = match workload_mode {
                 WorkloadMode::PointRead => {
                     Self::point_read_operation(&pool, &read_sql, document_id).await
@@ -314,15 +310,17 @@ ON CONFLICT (id) DO NOTHING"#
             };
 
             let latency = op_start.elapsed();
+            document_id = Self::next_document_id(document_id, document_step, document_count);
 
             if record {
-                let mut metrics = metrics.lock().await;
                 match result {
                     Ok(_) => metrics.record_success(latency),
                     Err(error) => metrics.record_failure(Self::format_workload_error(&error)),
                 }
             }
         }
+
+        metrics
     }
 
     async fn point_read_operation(
@@ -356,9 +354,8 @@ ON CONFLICT (id) DO NOTHING"#
         Ok(())
     }
 
-    fn next_document_id(next_document_id: &AtomicI64, document_count: i64) -> i64 {
-        let ordinal = next_document_id.fetch_add(1, Ordering::Relaxed);
-        ((ordinal - 1) % document_count) + 1
+    fn next_document_id(current: i64, step: i64, document_count: i64) -> i64 {
+        ((current - 1 + step) % document_count) + 1
     }
 
     fn quoted_table_name(&self) -> Result<String, WorkloadError> {

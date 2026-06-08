@@ -27,7 +27,7 @@ pub struct MetricsCollector {
 
 impl MetricsCollector {
     pub fn new() -> Self {
-        // Create histogram with max value of 1 hour (3,600,000 ms) and 3 significant digits
+        // Create histogram with max value of 1 hour in microseconds and 3 significant digits.
         let histogram =
             Histogram::<u64>::new_with_max(3_600_000_000, 3).expect("Failed to create histogram");
 
@@ -46,6 +46,16 @@ impl MetricsCollector {
 
     pub fn stop(&mut self) {
         self.end_time = Some(Instant::now());
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        self.histogram
+            .add(&other.histogram)
+            .expect("failed to merge latency histogram");
+        self.failures += other.failures;
+        for (cause, count) in &other.failure_causes {
+            *self.failure_causes.entry(cause.clone()).or_default() += count;
+        }
     }
 
     pub fn record_success(&mut self, latency: Duration) {
