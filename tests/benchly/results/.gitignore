@@ -1,0 +1,5 @@
+# Ignore all benchmark results
+*.json
+
+# Except the example
+!example.json

@@ -1,0 +1,41 @@
+{
+    "metadata": {
+        "benchmark_name": "insert_bench_1kb",
+        "run_label": "insert_bench_1kb",
+        "database_engine": "azure_documentdb",
+        "database": "benchmark_db",
+        "collection": "benchly_test",
+        "writers": 8,
+        "run_time": "90s",
+        "warmup": "5s",
+        "workload_params": {
+            "document_size": 1024,
+            "batch_size": 0,
+            "max_writes_per_sec": -1,
+            "drop_on_start": true
+        },
+        "start_time": "2026-06-05T01:40:46.777711387+00:00",
+        "end_time": "2026-06-05T01:42:16.782529809+00:00",
+        "duration_seconds": 90.00481813
+    },
+    "writes": {
+        "total_operations": 282342,
+        "total_documents": 282342,
+        "total_failures": 0,
+        "operations_per_sec": 3136.96539658793,
+        "documents_per_sec": 3136.96539658793,
+        "failures_per_sec": 0.0,
+        "latency_ms": {
+            "avg": 2.0453032138328697,
+            "min": 0.0,
+            "max": 24.0,
+            "p50": 2,
+            "p75": 2,
+            "p90": 3,
+            "p95": 4,
+            "p99": 6,
+            "p999": 10,
+            "p100": 24
+        }
+    }
+}
