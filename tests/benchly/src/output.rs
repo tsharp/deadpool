@@ -1,8 +1,9 @@
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 
 use crate::metrics::{LatencyStats, MetricsCollector};
 use crate::BenchmarkConfig;
@@ -24,12 +25,14 @@ pub struct BenchmarkMetadata {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct OperationStats {
     pub total_operations: usize,
+    pub successful_operations: usize,
     pub total_documents: usize,
     pub total_failures: usize,
     pub operations_per_sec: f64,
     pub documents_per_sec: f64,
     pub failures_per_sec: f64,
-    pub latency_ms: LatencyStats,
+    pub latency_us: LatencyStats,
+    pub failure_causes: HashMap<String, usize>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -45,9 +48,7 @@ impl BenchmarkResults {
         start_time: DateTime<Utc>,
         end_time: DateTime<Utc>,
     ) -> Self {
-        let duration_seconds = metrics.duration()
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
+        let duration_seconds = metrics.duration().map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
         let total_ops = metrics.total_operations();
         let ops_per_sec = metrics.operations_per_sec();
@@ -59,19 +60,34 @@ impl BenchmarkResults {
                 workers: config.workers,
                 run_time: format!("{}s", config.run_time.as_secs()),
                 warmup: format!("{}s", config.warmup.as_secs()),
-                workload_params: None, // Can be extended for specific workloads
+                workload_params: Some(HashMap::from([
+                    ("document_count".to_string(), json!(config.document_count)),
+                    ("document_table".to_string(), json!(config.document_table)),
+                    ("load_batch_size".to_string(), json!(config.load_batch_size)),
+                    (
+                        "use_timeout_pool".to_string(),
+                        json!(config.use_timeout_pool),
+                    ),
+                    ("require_tls".to_string(), json!(config.require_tls)),
+                    (
+                        "workload_mode".to_string(),
+                        json!(config.workload_mode.as_str()),
+                    ),
+                ])),
                 start_time,
                 end_time,
                 duration_seconds,
             },
             operations: OperationStats {
                 total_operations: total_ops,
-                total_documents: total_ops, // Assuming 1 operation = 1 document
+                successful_operations: metrics.successful_operations(),
+                total_documents: metrics.successful_operations(),
                 total_failures: metrics.total_failures(),
                 operations_per_sec: ops_per_sec,
                 documents_per_sec: ops_per_sec,
                 failures_per_sec: metrics.failures_per_sec(),
-                latency_ms: metrics.calculate_latency_stats(),
+                latency_us: metrics.calculate_latency_stats(),
+                failure_causes: metrics.failure_causes().clone(),
             },
         }
     }
