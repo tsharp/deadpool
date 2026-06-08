@@ -1,13 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
 mod metrics;
 mod output;
 mod runner;
-
-use metrics::MetricsCollector;
 use runner::BenchmarkRunner;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -163,11 +159,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.load_batch_size
     );
 
-    // Create metrics collector
-    let metrics = Arc::new(Mutex::new(MetricsCollector::new()));
-
     // Create and run benchmark
-    let runner = BenchmarkRunner::new(config.clone(), metrics.clone());
+    let runner = BenchmarkRunner::new(config.clone());
     let results = runner.run().await?;
 
     // Output results to JSON file
